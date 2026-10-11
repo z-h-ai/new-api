@@ -156,7 +156,7 @@ func TestPoloClientRequestCorrelationRejectsMalformedHeader(t *testing.T) {
 		t.Run(values[0], func(t *testing.T) {
 			router := gin.New()
 			router.Use(middleware.RequestId())
-			router.POST("/v1/chat/completions", func(c *gin.Context) { t.Fatal("invalid correlation must never reach the relay") })
+			router.POST("/v1/chat/completions", func(c *gin.Context) { require.FailNow(t, "invalid correlation must never reach the relay") })
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			for _, value := range values {
 				req.Header.Add("X-Polo-Request-Id", value)
