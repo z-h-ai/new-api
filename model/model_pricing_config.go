@@ -95,7 +95,7 @@ func defaultPricingMaps() map[string]map[string]any {
 
 func readModelPricingMaps(db *gorm.DB) (map[string]map[string]any, map[string]bool, []string, error) {
 	var rows []Option
-	if err := db.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Find(&rows).Error; err != nil {
+	if err := db.Where(commonKeyCol+" IN ?", modelPricingOptionKeys).Order(commonKeyCol + " ASC").Find(&rows).Error; err != nil {
 		return nil, nil, nil, err
 	}
 	values := defaultPricingMaps()
@@ -570,6 +570,13 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
 				return err
 			}
+		}
+		// A concurrent initializer may have won an ON CONFLICT insertion.
+		// Lock and reread the winners before validating expected versions or
+		// changing any map; the pre-insertion snapshot is no longer authoritative.
+		values, _, _, err = readModelPricingMaps(lockForUpdate(tx))
+		if err != nil {
+			return err
 		}
 		if err := mutate(tx, values); err != nil {
 			return err

@@ -416,6 +416,11 @@ func migrateClickHouseLogDB() error {
 	if err := LOG_DB.Exec(clickHouseLogCreateTableSQL(ttlDays)).Error; err != nil {
 		return err
 	}
+	for _, statement := range clickHouseLogCorrelationMigrationSQL() {
+		if err := LOG_DB.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
 	return syncClickHouseLogTTL(ttlDays)
 }
 
@@ -464,11 +469,21 @@ CREATE TABLE IF NOT EXISTS logs (
 	ip String DEFAULT '',
 	request_id String DEFAULT '',
 	upstream_request_id String DEFAULT '',
-	other String DEFAULT ''
+	client_request_id String DEFAULT '',
+	other String DEFAULT '',
+	INDEX idx_logs_client_request_id client_request_id TYPE bloom_filter GRANULARITY 1
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(toDateTime(created_at))
 ORDER BY (created_at, request_id)%s`, clickHouseLogTTLClause(ttlDays))
+}
+
+// Existing ClickHouse log tables do not go through GORM AutoMigrate.
+func clickHouseLogCorrelationMigrationSQL() []string {
+	return []string{
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS client_request_id String DEFAULT ''",
+		"ALTER TABLE logs ADD INDEX IF NOT EXISTS idx_logs_client_request_id client_request_id TYPE bloom_filter GRANULARITY 1",
+	}
 }
 
 func syncClickHouseLogTTL(ttlDays int) error {
