@@ -83,11 +83,20 @@ func TestClickHouseLogCreateTableSQL(t *testing.T) {
 	assert.Contains(t, withoutTTL, "ENGINE = MergeTree()")
 	assert.Contains(t, withoutTTL, "PARTITION BY toYYYYMM(toDateTime(created_at))")
 	assert.Contains(t, withoutTTL, "ORDER BY (created_at, request_id)")
+	assert.Contains(t, withoutTTL, "client_request_id String DEFAULT ''")
+	assert.Contains(t, withoutTTL, "INDEX idx_logs_client_request_id client_request_id TYPE bloom_filter GRANULARITY 1")
 	assert.NotContains(t, withoutTTL, "TTL ")
 
 	withTTL := clickHouseLogCreateTableSQL(30)
 	assert.Contains(t, withTTL, "ORDER BY (created_at, request_id)")
 	assert.Contains(t, withTTL, "TTL toDateTime(created_at) + INTERVAL 30 DAY DELETE")
+}
+
+func TestClickHouseLogCorrelationMigrationKeepsExistingRows(t *testing.T) {
+	assert.Equal(t, []string{
+		"ALTER TABLE logs ADD COLUMN IF NOT EXISTS client_request_id String DEFAULT ''",
+		"ALTER TABLE logs ADD INDEX IF NOT EXISTS idx_logs_client_request_id client_request_id TYPE bloom_filter GRANULARITY 1",
+	}, clickHouseLogCorrelationMigrationSQL())
 }
 
 func TestClickHouseCreateTableHasTTL(t *testing.T) {

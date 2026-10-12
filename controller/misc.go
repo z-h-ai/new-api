@@ -48,6 +48,10 @@ func GetStatus(c *gin.Context) {
 	legalSetting := system_setting.GetLegalSettings()
 
 	data := gin.H{
+		"polo_request_correlation": gin.H{
+			"version": 1, "header": common.ClientRequestIdHeader,
+			"log_field": common.ClientRequestIdKey, "query_parameter": common.ClientRequestIdKey,
+		},
 		"version":                     common.Version,
 		"start_time":                  common.StartTime,
 		"email_verification":          common.EmailVerificationEnabled,
