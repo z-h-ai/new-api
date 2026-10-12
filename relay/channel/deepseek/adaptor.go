@@ -90,6 +90,12 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if err := applyDeepSeekV4OpenAIThinkingSuffix(info, request); err != nil {
 		return nil, err
 	}
+	// DeepSeek accepts max_tokens, not the OpenAI completion-limit alias.
+	// Preserve an explicitly supplied native limit, including zero.
+	if request.MaxTokens == nil {
+		request.MaxTokens = request.MaxCompletionTokens
+	}
+	request.MaxCompletionTokens = nil
 
 	return request, nil
 }
