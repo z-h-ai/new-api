@@ -624,6 +624,16 @@ func TokenAuth() func(c *gin.Context) {
 		}
 		common.SetContextKey(c, constant.ContextKeyUsingGroup, userGroup)
 
+		managed, policyErr := model.RequiresManagedReservation(token.Id)
+		if policyErr != nil {
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable, "Managed authorization unavailable")
+			return
+		}
+		if managed && !(c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions" && c.Request.URL.RawQuery == "" && common.IsValidClientRequestId(c.GetString(common.ClientRequestIdKey))) {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "Managed token requires a bounded chat admission")
+			return
+		}
+
 		err = SetupContextForToken(c, token, parts...)
 		if err != nil {
 			return

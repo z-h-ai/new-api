@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -39,7 +41,8 @@ type tokenRequest struct {
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
+	AutoGroups           []string `json:"auto_groups"`
+	KeyFingerprintSHA256 string   `json:"key_fingerprint_sha256,omitempty"`
 }
 
 func maxTokenQuota() int {
@@ -170,7 +173,16 @@ func GetToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, buildMaskedTokenResponse(token))
+	// The owner-authorized detail read proves current credential identity
+	// without retrieving the usable secret through the sensitive reveal API.
+	// Hash the exact bytes returned by GetTokenKey; never add a prefix or hash the mask.
+	response := buildMaskedTokenResponse(token)
+	if token.Key != "" {
+		digest := sha256.Sum256([]byte(token.GetFullKey()))
+		response.KeyFingerprintSHA256 = fmt.Sprintf("%x", digest)
+	}
+	c.Header("Cache-Control", "no-store")
+	common.ApiSuccess(c, response)
 }
 
 func GetTokenAutoGroups(c *gin.Context) {
@@ -283,6 +295,10 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if token.ManagedReservationRequired && c.GetInt("role") != common.RoleRootUser {
+		common.ApiError(c, fmt.Errorf("managed reservation policy requires root authority"))
+		return
+	}
 	if len(token.Name) > 50 {
 		common.ApiErrorT(c, "Token name is too long")
 		return
@@ -327,20 +343,21 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:             c.GetInt("id"),
-		Name:               token.Name,
-		Key:                key,
-		CreatedTime:        common.GetTimestamp(),
-		AccessedTime:       common.GetTimestamp(),
-		ExpiredTime:        token.ExpiredTime,
-		RemainQuota:        token.RemainQuota,
-		UnlimitedQuota:     token.UnlimitedQuota,
-		ModelLimitsEnabled: token.ModelLimitsEnabled,
-		ModelLimits:        token.ModelLimits,
-		AllowIps:           token.AllowIps,
-		Group:              token.Group,
-		CrossGroupRetry:    token.CrossGroupRetry,
-		AutoGroups:         token.AutoGroups,
+		ManagedReservationRequired: token.ManagedReservationRequired,
+		UserId:                     c.GetInt("id"),
+		Name:                       token.Name,
+		Key:                        key,
+		CreatedTime:                common.GetTimestamp(),
+		AccessedTime:               common.GetTimestamp(),
+		ExpiredTime:                token.ExpiredTime,
+		RemainQuota:                token.RemainQuota,
+		UnlimitedQuota:             token.UnlimitedQuota,
+		ModelLimitsEnabled:         token.ModelLimitsEnabled,
+		ModelLimits:                token.ModelLimits,
+		AllowIps:                   token.AllowIps,
+		Group:                      token.Group,
+		CrossGroupRetry:            token.CrossGroupRetry,
+		AutoGroups:                 token.AutoGroups,
 	}
 	err = cleanToken.Insert()
 	if err != nil {
@@ -387,6 +404,10 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if token.ManagedReservationRequired && c.GetInt("role") != common.RoleRootUser {
+		common.ApiError(c, fmt.Errorf("managed reservation policy requires root authority"))
+		return
+	}
 	params := tokenAuditParams(c)
 	if token.Id > 0 {
 		params["id"] = token.Id

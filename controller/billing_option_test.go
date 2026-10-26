@@ -204,7 +204,7 @@ func TestPreConsumePolicyDatabaseMatrix(t *testing.T) {
 				t.Skip("set " + dialect.env + " to run this database")
 			}
 			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
-			require.NoError(t, db.AutoMigrate(&model.Token{}))
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.ManagedReservation{}))
 			for key, value := range map[string]string{
 				"quota_setting.trust_quota_usd":        "10.5",
 				"quota_setting.pre_consume_multiplier": "1.5",
@@ -322,4 +322,69 @@ func TestPreConsumeMultiplierRejectsInvalidRuntimeAndOverflow(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, info.Billing)
 	}
+}
+
+func TestReservationUpperBound(t *testing.T) {
+	for _, tc := range []struct {
+		name, expression string
+		input, output    int
+		minimum, maximum float64
+		reject           bool
+	}{
+		{"standard", `tier("base", p * 0.8 + c * 2.8 + cr * 0.23)`, 1000, 256, 1746.8, 1746.80001, false},
+		{"peak union", `hour("Asia/Shanghai") < 12 ? tier("peak",(p+c*4+cr*0.02)*2) : tier("off",p+c*4+cr*0.02)`, 1000, 256, 4088, 4088.00001, false},
+		{"free", `tier("free", p*0+c*0)`, 1000, 256, 0, 0, false},
+		{"request multiplier", `tier("request",fixed(0.01))*(param("service_tier")=="fast" ? 6:1)`, 1000, 256, 60000, 60000.00001, false},
+		{"subtraction clamped", `tier("text",max(len-cr,0)*2+c*4)`, 1000, 256, 3024, 3024.00001, false},
+		{"unknown numeric parameter", `tier("custom",p*param("rate"))`, 1000, 256, 0, 0, true},
+		{"zero crossing division", `tier("bad",p/c)`, 1000, 256, 0, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			value, err := billingexpr.ReservationUpperBound(tc.expression, tc.input, tc.output)
+			if tc.reject {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, value, tc.minimum)
+			assert.LessOrEqual(t, value, tc.maximum)
+		})
+	}
+}
+
+func TestManagedReservationQuoteUsesOriginalPriceAndDoesNotSpend(t *testing.T) {
+	previousConfig := config.GlobalConfig.ExportAllConfigs()
+	previousUnit := common.QuotaPerUnit
+	t.Cleanup(func() {
+		require.NoError(t, config.GlobalConfig.LoadFromDB(previousConfig))
+		common.QuotaPerUnit = previousUnit
+	})
+	common.QuotaPerUnit = 500000
+	db := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, db.AutoMigrate(&model.Token{}, &model.ManagedReservation{}))
+	user := model.User{Username: "reservation-user", Group: "default", Quota: 10000, AffCode: "reservation-aff"}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "reservation-test-key", Status: common.TokenStatusEnabled, RemainQuota: 10000}
+	require.NoError(t, db.Create(&token).Error)
+	require.NoError(t, model.UpdateOption("billing_setting.billing_expr", `{"reservation-model":"tier(\"base\",p*0.8+c*2.8+cr*0.23)"}`))
+	require.NoError(t, model.UpdateOption("billing_setting.billing_mode", `{"reservation-model":"tiered_expr"}`))
+	var response struct {
+		Success bool
+		Data    struct {
+			NativeQuota    int    `json:"native_quota"`
+			TokenID        int    `json:"token_id"`
+			PricingVersion string `json:"pricing_version"`
+		}
+	}
+	modelManagementRequest(t, QuoteManagedTextReservation, http.MethodPost, "/api/option/model_pricing/reserve_quote", map[string]any{"nonce": strings.Repeat("a", 32), "body_sha256": strings.Repeat("b", 64), "model": "reservation-model", "token_id": token.Id, "input_tokens": 1000, "max_output_tokens": 256}, &response)
+	require.True(t, response.Success)
+	assert.Equal(t, 874, response.Data.NativeQuota)
+	assert.Equal(t, token.Id, response.Data.TokenID)
+	assert.Len(t, response.Data.PricingVersion, 64)
+	var after model.User
+	require.NoError(t, db.First(&after, user.Id).Error)
+	assert.Equal(t, 10000, after.Quota)
+	var invalid struct{ Success bool }
+	modelManagementRequest(t, QuoteManagedTextReservation, http.MethodPost, "/api/option/model_pricing/reserve_quote", map[string]any{"model": "reservation-model", "token_id": token.Id, "input_tokens": 1000, "max_output_tokens": uint64(math.MaxUint64)}, &invalid)
+	assert.False(t, invalid.Success)
 }
