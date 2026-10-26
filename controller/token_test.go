@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -512,6 +513,51 @@ func TestGetTokenMasksKeyInResponse(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("detail response leaked raw token key: %s", recorder.Body.String())
+	}
+}
+
+func TestGetTokenFingerprintTracksCurrentOwnedCredential(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	token := seedToken(t, db, 1, "fingerprint-token", "0123456789abcdef0123456789abcdef0123456789abcdef")
+	for _, tc := range []struct {
+		name    string
+		owner   int
+		key     string
+		status  int
+		allowed bool
+	}{
+		{"owned", 1, token.Key, 1, true},
+		{"other owner", 2, token.Key, 1, false},
+		{"missing identity", 0, token.Key, 1, false},
+		{"revoked credential metadata", 1, token.Key, 2, true},
+		{"replaced credential", 1, "replacement-fingerprint-secret", 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, db.Model(token).Updates(map[string]any{"key": tc.key, "status": tc.status}).Error)
+			ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/"+strconv.Itoa(token.Id), nil, tc.owner)
+			ctx.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+			GetToken(ctx)
+			response := decodeAPIResponse(t, recorder)
+			assert.Equal(t, tc.allowed, response.Success)
+			assert.NotContains(t, recorder.Body.String(), tc.key)
+			if !tc.allowed {
+				assert.NotContains(t, recorder.Body.String(), "key_fingerprint_sha256")
+				return
+			}
+			var data struct {
+				Fingerprint string `json:"key_fingerprint_sha256"`
+				Status      int    `json:"status"`
+			}
+			require.NoError(t, common.Unmarshal(response.Data, &data))
+			fullKey := (&model.Token{Key: tc.key}).GetFullKey()
+			assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(fullKey))), data.Fingerprint)
+			if tc.name == "owned" {
+				// Shared with Polo Admin provider-credential-fingerprint.test.ts.
+				assert.Equal(t, "34c26e154bab5ff544f29f8747a691d0fedd3b8a51655f27d0f585b1b2753970", data.Fingerprint)
+			}
+			assert.Equal(t, tc.status, data.Status)
+			assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		})
 	}
 }
 

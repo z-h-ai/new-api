@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -509,4 +510,40 @@ func TestApplyWebSocketSubprotocolAuthorizationReadsRepeatedHeaders(t *testing.T
 
 	assert.True(t, applyWebSocketSubprotocolAuthorization(header))
 	assert.Equal(t, "Bearer sk-later-field", header.Get("Authorization"))
+}
+
+func TestManagedTokenCannotBypassPermitViaOtherAuthenticatedRoutes(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	// Initialize native quoted column names exactly as service startup does.
+	oldDSN := os.Getenv("SQL_DSN")
+	os.Unsetenv("SQL_DSN")
+	t.Cleanup(func() { os.Setenv("SQL_DSN", oldDSN) })
+	savedDB := model.DB
+	oldSQLite := common.SQLitePath
+	common.SQLitePath = t.TempDir() + "/startup.db"
+	require.NoError(t, model.InitDB())
+	startupDB, _ := model.DB.DB()
+	startupDB.Close()
+	common.SQLitePath = oldSQLite
+	model.DB = savedDB
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.ManagedReservation{}))
+	user := model.User{Username: "managedroute", Status: common.UserStatusEnabled, Group: "default", Quota: 10000, AffCode: "routeaff"}
+	require.NoError(t, model.DB.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: strings.Repeat("a", 48), ManagedReservationRequired: true, Status: common.TokenStatusEnabled, RemainQuota: 10000, ExpiredTime: -1}
+	require.NoError(t, model.DB.Create(&token).Error)
+
+	for _, target := range []struct{ method, path string }{{"GET", "/v1/responses"}, {"GET", "/v1/realtime"}, {"POST", "/v1/images/generations"}, {"POST", "/v1/videos"}, {"POST", "/mj/submit/imagine"}, {"POST", "/v1beta/models/test:generateContent"}, {"POST", "/v1/chat/completions"}} {
+		t.Run(target.path, func(t *testing.T) {
+			hit := false
+			r := gin.New()
+			r.Use(RequestId(), TokenAuth())
+			r.Handle(target.method, target.path, func(c *gin.Context) { hit = true; c.Status(200) })
+			req := httptest.NewRequest(target.method, target.path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer sk-"+token.Key)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			require.Equal(t, http.StatusForbidden, w.Code, w.Body.String())
+			require.False(t, hit)
+		})
+	}
 }
