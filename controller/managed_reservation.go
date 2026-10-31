@@ -10,12 +10,53 @@ import (
 	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// CloseManagedTextReservation is background recovery for an original permit.
+// The primary-database UPDATE competes with consumption; it never changes a
+// wallet or claims that a consumed request had no cost.
+func CloseManagedTextReservation(c *gin.Context) {
+	var request struct {
+		Nonce      string `json:"nonce"`
+		TokenID    int    `json:"token_id"`
+		Model      string `json:"model"`
+		BodySHA256 string `json:"body_sha256"`
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
+	var fields map[string]common.RawMessage
+	if err != nil || common.Unmarshal(raw, &fields) != nil || len(fields) != 4 || fields["nonce"] == nil || fields["token_id"] == nil || fields["model"] == nil || fields["body_sha256"] == nil || common.Unmarshal(raw, &request) != nil || !common.IsValidClientRequestId(request.Nonce) || request.TokenID <= 0 || request.Model == "" || len(request.Model) > 256 || !validReservationHash(request.BodySHA256) {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "original nonce, token, model and body hash required"})
+		return
+	}
+	identity := map[string]any{"nonce": request.Nonce, "token_id": request.TokenID, "model": request.Model, "body_sha256": request.BodySHA256}
+	result := model.DB.WithContext(c.Request.Context()).Model(&model.ManagedReservation{}).Where(identity).Where("consumed = ?", false).Update("expires_at", 0)
+	if result.Error != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"success": false, "message": "original permit closure unresolved"})
+		return
+	}
+	state := "closed_unused"
+	if result.RowsAffected == 0 {
+		var permit model.ManagedReservation
+		if err := model.DB.WithContext(c.Request.Context()).Where(identity).First(&permit).Error; err != nil {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "original permit unavailable"})
+			return
+		}
+		if permit.Consumed {
+			state = "consumed"
+		} else if permit.ExpiresAt != 0 {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "message": "original permit closure unresolved"})
+			return
+		}
+	}
+	c.Header("Cache-Control", "private, no-store")
+	common.ApiSuccess(c, gin.H{"nonce": request.Nonce, "token_id": request.TokenID, "model": request.Model, "body_sha256": request.BodySHA256, "state": state})
+}
 
 // QuoteManagedTextReservation creates a root-issued single-use permit without
 // a model call, wallet write, token creation, or replacement pricing table. Polo binds this quote before

@@ -96,7 +96,9 @@ func TestManagedPermitClosureCompetesWithOriginalConsumption(t *testing.T) {
 				context.Request = httptest.NewRequest("POST", "/api/option/model_pricing/reservation/close", strings.NewReader(string(raw)))
 				CloseManagedTextReservation(context)
 				var response struct {
-					Data struct { State string `json:"state"` } `json:"data"`
+					Data struct {
+						State string `json:"state"`
+					} `json:"data"`
 				}
 				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 				return recorder.Code, response.Data.State
@@ -118,6 +120,36 @@ func TestManagedPermitClosureCompetesWithOriginalConsumption(t *testing.T) {
 			status, state = closePermit(consumed, nil)
 			require.Equal(t, 200, status)
 			require.Equal(t, "consumed", state)
+			racing := issue(107)
+			start := make(chan struct{})
+			consumption := make(chan struct {
+				rows int64
+				err  error
+			}, 1)
+			go func() {
+				<-start
+				result := db.Model(&model.ManagedReservation{}).Where("nonce = ? AND consumed = ? AND expires_at > ?", racing, false, oldNow).Update("consumed", true)
+				consumption <- struct {
+					rows int64
+					err  error
+				}{result.RowsAffected, result.Error}
+			}()
+			close(start)
+			status, state = closePermit(racing, nil)
+			winner := <-consumption
+			// A transient SQLite writer conflict is unknown, so retry the same
+			// close after both contenders finish; never manufacture success.
+			if status != 200 {
+				status, state = closePermit(racing, nil)
+			}
+			require.Equal(t, 200, status)
+			if state == "closed_unused" {
+				require.Zero(t, winner.rows)
+			} else {
+				require.Equal(t, "consumed", state)
+				require.NoError(t, winner.err)
+				require.EqualValues(t, 1, winner.rows)
+			}
 			for index, override := range []map[string]any{{"token_id": 8}, {"model": "another-model"}, {"body_sha256": strings.Repeat("b", 64)}, {"unknown": true}} {
 				nonce := issue(103 + index)
 				status, state = closePermit(nonce, override)
