@@ -118,12 +118,15 @@ func TestManagedPermitClosureCompetesWithOriginalConsumption(t *testing.T) {
 			status, state = closePermit(consumed, nil)
 			require.Equal(t, 200, status)
 			require.Equal(t, "consumed", state)
-			for _, override := range []map[string]any{{"token_id": 8}, {"model": "another-model"}, {"body_sha256": strings.Repeat("b", 64)}, {"unknown": true}} {
-				status, state = closePermit(issue(103+len(override)), override)
+			for index, override := range []map[string]any{{"token_id": 8}, {"model": "another-model"}, {"body_sha256": strings.Repeat("b", 64)}, {"unknown": true}} {
+				nonce := issue(103 + index)
+				status, state = closePermit(nonce, override)
 				require.NotEqual(t, 200, status)
 				require.Empty(t, state)
-				// Reuse a fresh row in the next table case.
-				require.NoError(t, db.Where("nonce = ?", fmt.Sprintf("%032x", 104)).Delete(&model.ManagedReservation{}).Error)
+				var unchanged model.ManagedReservation
+				require.NoError(t, db.Where("nonce = ?", nonce).First(&unchanged).Error)
+				require.False(t, unchanged.Consumed)
+				require.Positive(t, unchanged.ExpiresAt)
 			}
 			status, state = closePermit(fmt.Sprintf("%032x", 999), nil)
 			require.NotEqual(t, 200, status)
