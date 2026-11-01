@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -67,4 +68,101 @@ func TestManagedPermitGuardsActualWireBeforeConsumption(t *testing.T) {
 	var after model.User
 	require.NoError(t, db.First(&after, user.Id).Error)
 	require.Equal(t, 10000, after.Quota)
+}
+
+func TestManagedPermitClosureCompetesWithOriginalConsumption(t *testing.T) {
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip(dialect.env + " is not configured")
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			require.NoError(t, db.AutoMigrate(&model.ManagedReservation{}))
+			const bodyHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			issue := func(number int) string {
+				nonce := fmt.Sprintf("%032x", number)
+				require.NoError(t, db.Create(&model.ManagedReservation{Nonce: nonce, TokenID: 7, Model: "permit-model", BodySHA256: bodyHash, ExpiresAt: time.Now().Add(time.Minute).Unix()}).Error)
+				return nonce
+			}
+			closePermit := func(nonce string, overrides map[string]any) (int, string) {
+				payload := map[string]any{"nonce": nonce, "token_id": 7, "model": "permit-model", "body_sha256": bodyHash}
+				for key, value := range overrides {
+					payload[key] = value
+				}
+				raw, err := common.Marshal(payload)
+				require.NoError(t, err)
+				recorder := httptest.NewRecorder()
+				context, _ := gin.CreateTestContext(recorder)
+				context.Request = httptest.NewRequest("POST", "/api/option/model_pricing/reservation/close", strings.NewReader(string(raw)))
+				CloseManagedTextReservation(context)
+				var response struct {
+					Data struct {
+						State string `json:"state"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				return recorder.Code, response.Data.State
+			}
+			closed := issue(101)
+			oldNow := time.Now().Unix()
+			status, state := closePermit(closed, nil)
+			require.Equal(t, 200, status)
+			require.Equal(t, "closed_unused", state)
+			// A consume UPDATE sent with an earlier timestamp cannot win later.
+			late := db.Model(&model.ManagedReservation{}).Where("nonce = ? AND consumed = ? AND expires_at > ?", closed, false, oldNow).Update("consumed", true)
+			require.NoError(t, late.Error)
+			require.Zero(t, late.RowsAffected)
+			status, state = closePermit(closed, nil)
+			require.Equal(t, 200, status)
+			require.Equal(t, "closed_unused", state)
+			consumed := issue(102)
+			require.NoError(t, db.Model(&model.ManagedReservation{}).Where("nonce = ? AND consumed = ?", consumed, false).Update("consumed", true).Error)
+			status, state = closePermit(consumed, nil)
+			require.Equal(t, 200, status)
+			require.Equal(t, "consumed", state)
+			racing := issue(107)
+			start := make(chan struct{})
+			consumption := make(chan struct {
+				rows int64
+				err  error
+			}, 1)
+			go func() {
+				<-start
+				result := db.Model(&model.ManagedReservation{}).Where("nonce = ? AND consumed = ? AND expires_at > ?", racing, false, oldNow).Update("consumed", true)
+				consumption <- struct {
+					rows int64
+					err  error
+				}{result.RowsAffected, result.Error}
+			}()
+			close(start)
+			status, state = closePermit(racing, nil)
+			winner := <-consumption
+			// A transient SQLite writer conflict is unknown, so retry the same
+			// close after both contenders finish; never manufacture success.
+			if status != 200 {
+				status, state = closePermit(racing, nil)
+			}
+			require.Equal(t, 200, status)
+			if state == "closed_unused" {
+				require.Zero(t, winner.rows)
+			} else {
+				require.Equal(t, "consumed", state)
+				require.NoError(t, winner.err)
+				require.EqualValues(t, 1, winner.rows)
+			}
+			for index, override := range []map[string]any{{"token_id": 8}, {"model": "another-model"}, {"body_sha256": strings.Repeat("b", 64)}, {"unknown": true}} {
+				nonce := issue(103 + index)
+				status, state = closePermit(nonce, override)
+				require.NotEqual(t, 200, status)
+				require.Empty(t, state)
+				var unchanged model.ManagedReservation
+				require.NoError(t, db.Where("nonce = ?", nonce).First(&unchanged).Error)
+				require.False(t, unchanged.Consumed)
+				require.Positive(t, unchanged.ExpiresAt)
+			}
+			status, state = closePermit(fmt.Sprintf("%032x", 999), nil)
+			require.NotEqual(t, 200, status)
+			require.Empty(t, state)
+		})
+	}
 }

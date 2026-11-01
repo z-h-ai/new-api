@@ -222,6 +222,7 @@ func SetApiRouter(router *gin.Engine) {
 			optionRoute.POST("/model_pricing/convert", controller.PreviewModelPricingConversion)
 			optionRoute.POST("/model_pricing/preview", controller.PreviewModelPricing)
 			optionRoute.POST("/model_pricing/reserve_quote", controller.QuoteManagedTextReservation)
+			optionRoute.POST("/model_pricing/reservation/close", controller.CloseManagedTextReservation)
 			optionRoute.POST("/managed_token/:id", controller.EnableManagedToken)
 			optionRoute.POST("/payment_compliance", controller.ConfirmPaymentCompliance)
 			optionRoute.GET("/channel_affinity_cache", controller.GetChannelAffinityCacheStats)
